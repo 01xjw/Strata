@@ -6391,6 +6391,7 @@ int main(int argc, char** argv) {
     // CUDA error left set by the failed `cudaHostRegister` and read later by `gr_read`'s launch check.  See the
     // note in `pinned.cu`.
     strata::core::FileExpertSource src;
+    bool io_pf_by_default = false;   // the Linux file-tier defaults turned io prefetch on (no STRATA_IO_PREFETCH given)
     {   // the card, and whether this build has code for it (a binary built for other GPUs fails at its first kernel
         // otherwise, after the whole expert arena has loaded) - before the arena starts loading
         int dev = 0;
@@ -6529,6 +6530,7 @@ int main(int argc, char** argv) {
         if (io_pf_default || (io_pf_env != nullptr && std::atoi(io_pf_env) != 0)) {
             const char* th = std::getenv("STRATA_IO_PF_THREADS");
             src.set_io_prefetch(true, th != nullptr ? std::atoi(th) : 0);
+            io_pf_by_default = io_pf_default && src.io_prefetch();
             if (src.io_prefetch() && io_pf_default) {
                 const char* cv = std::getenv("STRATA_COLD_OVERLAP");
                 std::fprintf(stderr, "strata generate: file tier (Linux defaults, %s): page-cached experts "
@@ -7661,6 +7663,30 @@ int main(int argc, char** argv) {
     drive.d.src = srcp;
     drive.d.n_expert = g.n_expert;
     drive.d.jobs.resize((size_t) K);
+    // Every expert in the GPU caches once they are filled: the decode reads nothing from the file tier, and its Linux
+    // defaults (io prefetch, the decode gate) and the routing-aware prefetch only cost time.  Measured on 2x W7900D (gfx1100),
+    // IQ3_S experts.bin, a layer split holding 24576 of 24576: decode 57 -> 80 tok/s, the output byte-identical.
+    // STRATA_IO_PREFETCH=1 keeps io prefetch, STRATA_LOOKAHEAD=1 the routing-aware prefetch.
+    bool gpu_holds_all = false;
+    if (srcp == &src) {
+        int64_t held = 0;
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            const int st = multi_gpu ? stage_of(l) : 0;
+            for (int64_t e = 0; e < g.n_expert; ++e)
+                held += (st > 0 ? stages[(size_t) st - 1]->cache.slot_of(l, e) : xcache.slot_of(l, e)) != strata::core::kNotResident;
+        }
+        gpu_holds_all = held == g.n_layers * g.n_expert;
+        if (gpu_holds_all && io_pf_by_default) {
+            src.set_io_prefetch(false, 0);
+            const char* sv = std::getenv("STRATA_IO_STATS");
+            src.set_io_stats(sv != nullptr && std::atoi(sv) != 0);
+            std::fprintf(stderr, "strata generate: every expert is in the GPU caches (%lld of %lld): the file tier's Linux defaults "
+                                 "(io prefetch, the decode gate) are off, the decode reads nothing from it (STRATA_IO_PREFETCH=1 keeps them)\n",
+                         (long long) held, (long long) (g.n_layers * g.n_expert));
+        }
+    }
+    const char* la_env = std::getenv("STRATA_LOOKAHEAD");
+    const bool la_asked = la_env != nullptr && la_env[0] != '\0' && std::atoi(la_env) != 0;
     // CS-T: routing-aware prefetch of the file tier (the GGUF in place): the next layer's router on this layer's MoE
     // input predicts its experts and their pages are warmed meanwhile.  It only warms pages; STRATA_LOOKAHEAD=0 is
     // the A/B arm, STRATA_LOOKAHEAD_K the experts per token (default 10).
@@ -7671,8 +7697,10 @@ int main(int argc, char** argv) {
                           [] { const char* v = std::getenv("STRATA_FS_AHEAD"); return v == nullptr || std::atoi(v) != 0; }();
     // STRATA_LOOKAHEAD_STATS=1 (measurement only): run the predictor on any tier and score it against the real routing
     const bool la_stats = srcp != nullptr && [] { const char* v = std::getenv("STRATA_LOOKAHEAD_STATS"); return v != nullptr && std::atoi(v) != 0; }();
-    if (srcp != nullptr && ((srcp == &src && src.warms()) || fs_ahead || la_stats) &&
-        [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v == nullptr || std::atoi(v) != 0; }()) {
+    if (srcp == &src && src.warms() && gpu_holds_all && !la_asked && !fs_ahead && !la_stats)
+        std::fprintf(stderr, "strata generate: routing-aware prefetch off (every expert is in the GPU caches; STRATA_LOOKAHEAD=1 runs it)\n");
+    if (srcp != nullptr && ((srcp == &src && src.warms() && (!gpu_holds_all || la_asked)) || fs_ahead || la_stats) &&
+        (la_env == nullptr || std::atoi(la_env) != 0)) {
         std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
         bool ok = true;
         for (int64_t l = 0; l < g.n_layers && ok; ++l) {
