@@ -25,6 +25,12 @@ inline bool gfx_arch_is_gfx11_wmma(const char* gcn) {
            gfx_arch_is(gcn, "gfx1150") || gfx_arch_is(gcn, "gfx1151");
 }
 
+/// RDNA3 discrete GPUs.  Keep this separate from `gfx_arch_is_gfx11_wmma`: that helper also includes RDNA3.5 APUs,
+/// whose unified-memory defaults must not be copied to a discrete gfx110x card (or the other way around).
+inline bool gfx_arch_is_rdna3_dgpu(const char* gcn) {
+    return gfx_arch_is(gcn, "gfx1100") || gfx_arch_is(gcn, "gfx1101") || gfx_arch_is(gcn, "gfx1102");
+}
+
 /// The gfx12 (RDNA4) targets the gfx12 matrix-core kernels are compiled for (`#if defined(__gfx1200__) ||
 /// defined(__gfx1201__)`): the R9700 / 9070 (XT) are gfx1201, the 9060 (XT) gfx1200.
 inline bool gfx_arch_is_gfx12_wmma(const char* gcn) { return gfx_arch_is(gcn, "gfx1200") || gfx_arch_is(gcn, "gfx1201"); }

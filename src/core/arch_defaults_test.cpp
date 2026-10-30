@@ -12,6 +12,14 @@
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL line %d: %s\n", __LINE__, #c); ++fails; } } while (0)
 
+static bool changes_bits(const std::string& name) {
+    for (const char* bits : {"STRATA_PF_GEMM", "STRATA_PF_FUSED", "STRATA_HC_UPMIX", "STRATA_PA_FAST",
+                             "STRATA_HIP_WMMA", "STRATA_SELECT_WMMA", "STRATA_HC_Q8", "STRATA_PF_HCDOWN",
+                             "STRATA_WMMA_GEMM", "STRATA_ROUTE_TAIL_SKIP"})
+        if (name == bits) return true;
+    return false;
+}
+
 static void unset(const char* k) {
 #if defined(_WIN32)
     _putenv_s(k, "");
@@ -30,10 +38,10 @@ static void put(const char* k, const char* v) {
 int main() {
     using namespace strata::core;
     unset("STRATA_GFX1151_DEFAULTS");
-    // other architectures (and CUDA, which passes an empty name): nothing
-    CHECK(arch_default_env("gfx1100").empty());
-    CHECK(arch_default_env("gfx1150").empty());
-    CHECK(arch_default_env("gfx1152").empty());
+    // Other architectures (and CUDA, which passes an empty name): nothing.  RDNA3 discrete defaults remain empty
+    // until each candidate has been measured on gfx110x and shown byte-identical.
+    for (const char* a : {"gfx1100", "gfx1100:sramecc-:xnack-", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1152"})
+        CHECK(arch_default_env(a).empty());
     CHECK(arch_default_env("gfx11510").empty());   // not a prefix match
     CHECK(arch_default_env("").empty());
     CHECK(arch_default_env(nullptr).empty());
@@ -43,9 +51,7 @@ int main() {
         CHECK(t.size() >= 10);
         for (const auto& kv : t) {
             CHECK(kv.first.rfind("STRATA_", 0) == 0);
-            for (const char* bits : {"STRATA_PF_GEMM", "STRATA_PF_FUSED", "STRATA_HC_UPMIX", "STRATA_PA_FAST", "STRATA_HIP_WMMA",
-                                     "STRATA_SELECT_WMMA", "STRATA_HC_Q8", "STRATA_PF_HCDOWN", "STRATA_WMMA_GEMM"})
-                CHECK(kv.first != bits);
+            CHECK(!changes_bits(kv.first));
         }
     }
     // 0.2.7: STRATA_SH_STREAM.  Windows gfx1151 leaves the shared-expert fork off (it measured slower there, same ids); Linux gfx1151,
@@ -121,8 +127,10 @@ int main() {
             if (kv.first == "STRATA_EXPDEC") expdec = kv.second == "1";
         }
         CHECK(attn_lane && attn_merge && tsum && expdec);   // the 0.2.7 R9700 decode measurement, bit-identical
-        for (const auto& kv : t) CHECK(kv.first != "STRATA_HCD_EXACT");
         for (const auto& kv : t) {
+            CHECK(kv.first.rfind("STRATA_", 0) == 0);
+            CHECK(!changes_bits(kv.first));
+            CHECK(kv.first != "STRATA_HCD_EXACT");
             CHECK(kv.first != "STRATA_Q8_PACKED" && kv.first != "STRATA_SH_STREAM" && kv.first != "STRATA_PF_GEMM" &&
                   kv.first != "STRATA_PF_FUSED");
         }

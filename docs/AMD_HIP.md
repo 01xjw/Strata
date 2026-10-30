@@ -378,6 +378,17 @@ Merge the field into the existing config (this is not a complete run config), ch
 engine, and remove it to go back. If the engine runs in a systemd unit, limit it with `MemoryMax`, never `MemoryHigh`:
 `MemoryHigh` counts the page cache that `--mmap-experts` reads from.
 
+## RDNA3 discrete validation status (gfx1100 / gfx1101 / gfx1102)
+
+RDNA3 discrete cards do not have an architecture default table yet.  The exact candidates are tracked in
+`docs/RDNA3_VALIDATION.md`; they must be measured one at a time with byte-identical 4K/32K/64K outputs, same-day speed
+comparisons and at least two model formats before they become defaults.
+
+On 2026-10-13 a gfx1100 Kubernetes pod passed the model-free readiness subset on unused 1-, 2- and 4-card views
+(`HIP_VISIBLE_DEVICES=2`, `2,3`, `2,3,4,5`): device listing, `strata-device --selftest`, and the seven key HIP tests
+all passed.  The raw log is in `bench/results/rdna3-cluster/rdna3-1-2-4.log`.  This validates the build/test path and
+GDN recurrence parity on gfx1100, but it is not an end-to-end A/B and does not by itself enable any default switch.
+
 ## RDNA4 (gfx1201)
 
 The RX 9070 / 9070 XT and the Radeon AI PRO R9700 run the same kernels as gfx1100: wave32, 64 KiB of LDS per workgroup, the
