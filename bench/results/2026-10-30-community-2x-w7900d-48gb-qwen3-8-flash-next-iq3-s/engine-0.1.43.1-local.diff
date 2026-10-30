@@ -1,0 +1,397 @@
+diff --git a/include/strata/core/conversation_snapshot.hpp b/include/strata/core/conversation_snapshot.hpp
+index 80b1de8b..e3ec48b9 100644
+--- a/include/strata/core/conversation_snapshot.hpp
++++ b/include/strata/core/conversation_snapshot.hpp
+@@ -25,6 +25,10 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& state
+                               int64_t upto, bool include_index, std::string& error);
+ bool conversation_kv_restore(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
+                              int64_t upto, bool include_index, std::string& error);
++// conversation_kv_save(from) + conversation_kv_restore(to) without the host image: the same bytes and the same
++// residency refresh.  Both states must share one K/V layout.  Caller synchronizes as for save/restore.
++bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
++                          int64_t upto, bool include_index, std::string& error);
+ // Diagnostic read-back after a synchronized restore. Uses 64 KiB of stack
+ // workspace, compares authoritative bytes and resident draft-ring pages, and
+ // fingerprints the authoritative payload only. Never changes model state.
+@@ -60,6 +64,11 @@ bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const Sess
+                                   const ModelGeometry& g, std::string& error);
+ bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, SessionState& session,
+                                      const ModelGeometry& g, std::string& error);
++/// checkpoint_save(from) + checkpoint_restore(to) of the prefix `ids` without the host image: the running state goes
++/// straight from one session's buffers to the other's (device to device when both are on one GPU).  Both sessions
++/// must own the same layer carve.  Synchronizes the device before; every copy has landed on return.
++bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, const ModelGeometry& g,
++                                  const std::vector<int32_t>& ids, std::string& error);
+ 
+ struct ConversationView {
+     const std::vector<int32_t>& ids;
+diff --git a/src/core/conversation_copy.hpp b/src/core/conversation_copy.hpp
+index 0dea46a3..b9e78fe5 100644
+--- a/src/core/conversation_copy.hpp
++++ b/src/core/conversation_copy.hpp
+@@ -19,7 +19,7 @@ namespace strata::core::conversation_detail {
+ /// device, and while another thread captures a graph on one (a drafter or a stage worker), HIP refuses it with
+ /// "operation would make the legacy stream depend on a capturing blocking stream".  The caller's contract is
+ /// unchanged: the device was synchronized before the copy (the copy itself is complete on return).
+-inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes) {
++inline cudaError_t nonblocking_stream(cudaStream_t& s) {
+     int dev = 0;
+     cudaError_t e = cudaGetDevice(&dev);
+     if (e != cudaSuccess) return e;
+@@ -30,14 +30,33 @@ inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes) {
+         e = cudaStreamCreateWithFlags(&streams[(size_t) dev], cudaStreamNonBlocking);
+         if (e != cudaSuccess) { streams[(size_t) dev] = nullptr; return e; }
+     }
+-    cudaStream_t s = streams[(size_t) dev];
+-    e = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, s);
++    s = streams[(size_t) dev];
++    return cudaSuccess;
++}
++
++/// copy_nonblocking without the wait: the copy is queued on the device's private stream, and copies_wait() is the
++/// point where every queued copy has landed.  On ROCm each wait after a small copy costs ~0.3-0.5 ms.
++inline cudaError_t copy_enqueue(void* dst, const void* src, size_t bytes) {
++    cudaStream_t s = nullptr;
++    const cudaError_t e = nonblocking_stream(s);
++    return e != cudaSuccess ? e : cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, s);
++}
++
++inline cudaError_t copies_wait() {
++    cudaStream_t s = nullptr;
++    cudaError_t e = nonblocking_stream(s);
+     if (e != cudaSuccess) return e;
+     e = cudaStreamSynchronize(s);
+-    core::progress_beat();   // #2049: a parked conversation is many of these; each one that lands is progress
++    core::progress_beat();
+     return e;
+ }
+ 
++inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes) {
++    const cudaError_t e = copy_enqueue(dst, src, bytes);
++    if (e != cudaSuccess) return e;
++    return copies_wait();   // #2049: a parked conversation is many of these; each one that lands is progress
++}
++
+ /// #2049 #2065 #1971: a host-to-host copy that tells the watchdog it is moving.  Parked state (the running
+ /// checkpoints, the K/V segments) sits in ordinary pageable memory for the whole session; when the OS has written
+ /// it to the pagefile, copying it back runs at the drive's page-in speed (measured in the reports: ~190 hard faults
+diff --git a/src/core/conversation_snapshot.cpp b/src/core/conversation_snapshot.cpp
+index 1468dc65..3d9f13b6 100644
+--- a/src/core/conversation_snapshot.cpp
++++ b/src/core/conversation_snapshot.cpp
+@@ -119,6 +119,23 @@ bool transfer(void* dst, const void* src, size_t n, std::string& error) {
+     error = std::string("conversation snapshot copy: ") + cudaGetErrorString(e);
+     return false;
+ }
++
++bool refresh_residency(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error) {
++    // VRAM slots still contain the outgoing conversation. Resolve must refill
++    // them from the restored authoritative pools before any attention reads.
++    if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
++    if (st.kv_mode == 2 && upto > 0) {
++        auto shapes = strata::kernels::qsa_real_shapes();
++        shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;
++        const int64_t end = (upto + shapes.page_size - 1) / shapes.page_size;
++        strata::kernels::kv_ring_restore(qsa_attn_pools(st), st.host, qsa_kv_format(st),
++                                        std::max<int64_t>(0, end - st.n_slots), end, st.n_slots, shapes, nullptr);
++    }
++    const auto status = cudaGetLastError();
++    if (status == cudaSuccess) return true;
++    error = std::string("conversation snapshot residency restore: ") + cudaGetErrorString(status);
++    return false;
++}
+ } // namespace
+ 
+ bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+@@ -210,20 +227,36 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
+         if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
+                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
+             })) return false;
+-    // VRAM slots still contain the outgoing conversation. Resolve must refill
+-    // them from the restored authoritative pools before any attention reads.
+-    if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
+-    if (st.kv_mode == 2 && upto > 0) {
+-        auto shapes = strata::kernels::qsa_real_shapes();
+-        shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;
+-        const int64_t end = (upto + shapes.page_size - 1) / shapes.page_size;
+-        strata::kernels::kv_ring_restore(qsa_attn_pools(st), st.host, qsa_kv_format(st),
+-                                        std::max<int64_t>(0, end - st.n_slots), end, st.n_slots, shapes, nullptr);
++    return refresh_residency(st, g, upto, error);
++}
++
++bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
++                          int64_t upto, bool index, std::string& error) {
++    Layout ls{}, ld{};
++    if (!layout(from, g, upto, index, ls, error) || !valid(from, ls, upto, error) ||
++        !layout(to, g, upto, index, ld, error) || !valid(to, ld, upto, error)) return false;
++    const std::array<size_t,5> sizes = {ld.data, ld.value_data, ld.scales, ld.value_scales, ld.pooled};
++    if (ls.format != ld.format || ls.cells != ld.cells || ls.page_size != ld.page_size ||
++        ls.pooled_rows != ld.pooled_rows ||
++        sizes != std::array<size_t,5>{ls.data, ls.value_data, ls.scales, ls.value_scales, ls.pooled}) {
++        error = "conversation snapshot: incompatible K/V geometry";
++        return false;
+     }
+-    const auto status = cudaGetLastError();
+-    if (status == cudaSuccess) return true;
+-    error = std::string("conversation snapshot residency restore: ") + cudaGetErrorString(status);
+-    return false;
++    const auto src = pools(from);
++    const auto dst = pools(to);
++    for (size_t i = 0; i < sizes.size(); ++i) {
++        if (!sizes[i]) continue;
++        if (!src[i] || !dst[i]) { error = "conversation snapshot: missing state buffer"; return false; }
++        if (const cudaError_t e = conversation_detail::copy_enqueue(dst[i], src[i], sizes[i]); e != cudaSuccess) {
++            error = std::string("conversation snapshot copy: ") + cudaGetErrorString(e);
++            return false;
++        }
++    }
++    if (const cudaError_t e = conversation_detail::copies_wait(); e != cudaSuccess) {
++        error = std::string("conversation snapshot copy: ") + cudaGetErrorString(e);
++        return false;
++    }
++    return refresh_residency(to, g, upto, error);
+ }
+ 
+ bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
+diff --git a/src/core/conversation_state.cpp b/src/core/conversation_state.cpp
+index 4fbcf88b..07c74dbf 100644
+--- a/src/core/conversation_state.cpp
++++ b/src/core/conversation_state.cpp
+@@ -194,6 +194,43 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
+     return sync(error);
+ }
+ 
++bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, const ModelGeometry& g,
++                                  const std::vector<int32_t>& ids, std::string& error) {
++    ConversationStateSizes z, zt;
++    if (!checkpoint_targets(from, g, ids.size(), z, error) || !checkpoint_targets(to, g, ids.size(), zt, error))
++        return false;
++    if (from.gdn_alloc != to.gdn_alloc || from.qsa_ord0 != to.qsa_ord0 || from.qsa_alloc != to.qsa_alloc ||
++        !from.ple_hist != !to.ple_hist || z.gdn != zt.gdn)
++        return fail(error, "running-state copy between different session carves");
++    if (!sync(error)) return false;
++    auto enqueue = [&](void* dst, const void* src, size_t bytes) {
++        if (!bytes) return true;
++        if (!dst || !src) return fail(error, "missing running-state buffer");
++        const auto status = conversation_detail::copy_enqueue(dst, src, bytes);
++        if (status == cudaSuccess) return true;
++        error = std::string("conversation snapshot running-state copy: ") + cudaGetErrorString(status);
++        return false;
++    };
++    if (!enqueue(to.gdn_state, from.gdn_state, z.gdn) ||
++        !enqueue(to.ple_hist, from.ple_hist, to.ple_hist ? z.ple : 0)) return false;
++    const size_t row = ids.size() / strata::kernels::qsa_real_shapes().idx_block;
++    for (size_t j = 0; j < owned_qsa(to); ++j) {
++        const auto& s = owned(from, j);
++        const auto& d = owned(to, j);
++        if (!enqueue(d.idx_tail, s.idx_tail, z.tail) || !enqueue(d.idx_dead, s.idx_dead, z.dead) ||
++            !enqueue(d.idx_block_pos, s.idx_block_pos, z.block_pos)) return false;
++        if (!ids.empty() && !enqueue(d.idx_pooled + row * g.idx_key_dim, s.idx_dead, z.dead)) return false;
++    }
++    if (const auto status = conversation_detail::copies_wait(); status != cudaSuccess) {
++        error = std::string("conversation snapshot running-state copy: ") + cudaGetErrorString(status);
++        return false;
++    }
++    const size_t tokens = ids.size();
++    to.ple_prev[0] = tokens >= 2 ? ids[tokens - 2] : -1;
++    to.ple_prev[1] = tokens >= 1 ? ids[tokens - 1] : -1;
++    return true;
++}
++
+ bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& ss,
+                                  const ModelGeometry& g, const QsaState* draft, size_t& bytes, std::string& error) {
+     bytes = 0;
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 1e5299e5..854f7afe 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -1604,9 +1604,11 @@ static bool pcie_auto_split_ok() {
+     return on;
+ }
+ 
+-// 0.1.43: the HIP defaults of the decode speed push (route tail skip, measured PCIe share) were measured on gfx1201 (Radeon AI PRO
+-// R9700) and apply on gfx1200 / gfx1201 only; every other AMD part (gfx11, gfx906, ...) keeps its earlier behaviour.  CUDA: always true.
+-[[maybe_unused]] static bool decode_defaults_arch_ok() {
++// 0.1.43: these HIP decode defaults were measured on gfx1201 (Radeon AI PRO R9700) and apply on gfx12 only.
++// Keep their policy gates separate: route-tail skip changes output, while PCIe auto and pipeline windows do not.
++// Enabling a measured exact optimization on RDNA3 must never silently enable the output-changing one too.  CUDA keeps
++// its existing defaults.
++[[maybe_unused]] static bool measured_decode_defaults_arch_ok() {
+ #if defined(STRATA_USE_HIP)
+     int dev = 0;
+     cudaDeviceProp p{};
+@@ -1617,6 +1619,22 @@ static bool pcie_auto_split_ok() {
+ #endif
+ }
+ 
++static bool pcie_auto_default_arch_ok() {
++    // TODO(rdna3-validation): add gfx110x only after paired PCIe-share measurements on the target card/link.
++    return measured_decode_defaults_arch_ok();
++}
++
++static bool pipeline_windows_default_arch_ok() {
++    // TODO(rdna3-validation): add gfx110x only after a 3+-stage layer-split A/B; two stages are known to lose.
++    return measured_decode_defaults_arch_ok();
++}
++
++static bool route_tail_skip_default_arch_ok() {
++    // TODO(rdna3-validation): this changes output (KL about 0.003-0.006).  Require quality and acceptance-rate results,
++    // separately from the exact PCIe/pipeline defaults, before adding any RDNA3 architecture.
++    return measured_decode_defaults_arch_ok();
++}
++
+ // The effective host->device bandwidth of the PCIe link: copies from pinned host memory, as the expert arena's
+ // reads are.  The native default share (0.55) was measured on x16 links (~26-28 GB/s); a x8 card in a x8 slot
+ // carries about half of that.  Returns < 0 when the probe cannot run (then the caller keeps the default).
+@@ -2201,6 +2219,8 @@ int main(int argc, char** argv) {
+         // 64K prompts: +0.5 .. +5.8%, residuals identical to 8192).  The fit scan still picks a smaller chunk when the expert cache cannot lend
+         // the buffers.  An explicit --prefill N, auto:N or STRATA_PREFILL_AUTO_MAX is never touched (prefill_auto_bare is false then).
+         // STRATA_GFX12_DEFAULTS=0 or STRATA_GFX12_CHUNK=0 keeps 8192.
++        // TODO(rdna3-validation): sweep auto:8192/16384/32768 on gfx110x with lend coverage, RAM and first-use/warm
++        // timings recorded; a single long-prompt report is not enough to change the bare-auto default.
+         const char* c0 = std::getenv("STRATA_GFX12_CHUNK");
+         const char* d0 = std::getenv("STRATA_GFX12_DEFAULTS");
+         cudaDeviceProp cp{};
+@@ -2802,7 +2822,7 @@ int main(int argc, char** argv) {
+             o.pcie_frac = pcie_frac_for_gbps(bw, base);
+             std::fprintf(stderr, "strata generate: PCIe probe: %.1f GB/s host->device (best of %s) -> pcie_frac %.2f "
+                                  "(default %.2f)\n", bw, bursts.c_str(), o.pcie_frac, base);
+-            o.pcie_frac_auto = (o.layer_split.empty() || pcie_auto_split_ok()) && decode_defaults_arch_ok() && !pf_old;
++            o.pcie_frac_auto = (o.layer_split.empty() || pcie_auto_split_ok()) && pcie_auto_default_arch_ok() && !pf_old;
+             o.pcie_probe_gbps = bw;
+         } else {
+             o.pcie_frac = base;
+@@ -3401,7 +3421,7 @@ int main(int argc, char** argv) {
+         const size_t min_st = am != nullptr ? (size_t) std::max(2, std::atoi(am)) : 3;
+         bool on = o.serve && multi_gpu && !split_same && split_devs.size() + 1 >= min_st && !(ae != nullptr && std::atoi(ae) == 0);
+ #if defined(STRATA_USE_HIP)
+-        on = on && decode_defaults_arch_ok();
++        on = on && pipeline_windows_default_arch_ok();
+ #else
+         on = false;
+ #endif
+@@ -3421,7 +3441,7 @@ int main(int argc, char** argv) {
+                         : split_devs.size() > 1 && o.pipeline_windows == 1 ? "--pipeline-windows 1 needs exactly two stages"
+                         : split_devs.size() > 1 && o.adapt_async ? "not with --adapt-async on three or more stages"
+                         : o.mtp.empty() || o.spec < 2 ? "it needs the MTP drafter (--mtp, --spec)"
+-                        : o.batch != 0 ? "not with --batch slots"
++                        : o.batch != 0 && o.pipeline_windows >= 2 ? "not with --batch slots (--pipeline-windows 1 is)"
+                         : o.peer_device >= 1 ? "not with --peer-device"
+                         : helpers ? "not with the helper caches (--expert-cache-device1..3, --remote-expert-opt)"
+                         : nullptr;
+@@ -4366,9 +4386,10 @@ int main(int argc, char** argv) {
+     const char* batch_mtp_env = std::getenv("STRATA_BATCH_MTP");
+     bool batch_mtp = o.batch_mtp || (batch_mtp_env != nullptr && batch_mtp_env[0] != '\0' && batch_mtp_env[0] != '0');
+     if (batch_mtp) {
+-        // (--pipeline-windows is already off with --batch slots)
++        // (--pipeline-windows 2 is already off with --batch slots; 1 binds the drafter to the pipeline's row buffer)
+         const char* why = o.batch < 2 ? "it needs --batch 2 or more" : o.mtp.empty() ? "it needs --mtp"
+-                        : o.spec < 2 ? "it needs --spec T (T >= 2)" : split_same
++                        : o.spec < 2 ? "it needs --spec T (T >= 2)"
++                        : o.pipeline_windows > 0 ? "not with --pipeline-windows 1" : split_same
+                         ? "it needs each stage of a layer split on its own GPU"
+                         : !o.serve ? "it needs --serve" : nullptr;
+         // the groups it would run with (the default gives way to it: one group; a number or auto given pipelines)
+@@ -8301,9 +8322,10 @@ int main(int argc, char** argv) {
+             const bool nearly_all_cached = !host_res.empty() && !all_experts_resident &&
+                                            (double) cached_experts >= max_cached * (double) host_res.size();
+             const bool tail_default_ok = tse == nullptr && !all_experts_resident && !nearly_all_cached && o.batch == 0 &&
+-                                         decode_defaults_arch_ok() &&
++                                         route_tail_skip_default_arch_ok() &&
+                                          o.peer_device < 0;
+-            if (tse == nullptr && nearly_all_cached && o.batch == 0 && o.peer_device < 0 && decode_defaults_arch_ok())
++            if (tse == nullptr && nearly_all_cached && o.batch == 0 && o.peer_device < 0 &&
++                route_tail_skip_default_arch_ok())
+                 std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP is off by default: %.1f%% of the experts are in the GPU cache, so "
+                                      "few are missed and skipping them costs more draft acceptance than it saves; "
+                                      "STRATA_ROUTE_TAIL_SKIP=7 turns it on\n", 100.0 * (double) cached_experts / (double) host_res.size());
+@@ -9347,14 +9369,49 @@ int main(int argc, char** argv) {
+             in_lines.pop_front();
+             return true;
+         };
++        // Slot copies go buffer to buffer on the stage's GPU; STRATA_BATCH_HOST_COPY=1 routes them through a host
++        // image instead (the save/restore pair a conversation snapshot uses, ~140 ms an admission on 2x gfx1100).
++        static const bool host_copy = [] {
++            const char* v = std::getenv("STRATA_BATCH_HOST_COPY");
++            return v != nullptr && std::atoi(v) != 0;
++        }();
++        // STRATA_BATCH_COPY_TIMING=1: each admission's slot copy by stage and phase (the device sync before it, the
++        // running state, the K/V, the sync after) on stderr
++        static const bool copy_timing = std::getenv("STRATA_BATCH_COPY_TIMING") != nullptr;
+         // the session a request just left behind (its prompt) -> slot b's sessions, on every stage
+         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
+             const int64_t upto = (int64_t) ids.size();
++            std::string phases;
++            auto lap = [&](Clock::time_point& t, const char* what) {
++                if (!copy_timing) return;
++                const auto now = Clock::now();
++                char buf[48];
++                std::snprintf(buf, sizeof buf, " %s %.1f", what, std::chrono::duration<double, std::milli>(now - t).count());
++                phases += buf;
++                t = now;
++            };
+             for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                 strata::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
+                 strata::core::SessionState& to = *bslot_ss[k][(size_t) b];
+                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
++                auto t = Clock::now();
++                if (copy_timing) phases += " | stage " + std::to_string(k) + ":";
+                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
++                lap(t, "sync");
++                if (!host_copy) {
++                    if (!strata::core::conversation_checkpoint_copy(from, to, g, ids, e)) return false;
++                    lap(t, "state");
++                    for (int64_t j = 0; j < from.qsa_alloc; ++j)
++                        if (!strata::core::conversation_kv_copy(from.qsa_states[from.qsa_ord0 + j],
++                                                                to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
++                            return false;
++                    lap(t, "kv");
++                    if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
++                    lap(t, "end");
++                    if (copy_timing && k + 1 == bslot_ss.size())
++                        std::fprintf(stderr, "strata batch: slot %d copy ms%s\n", b, phases.c_str());
++                    continue;
++                }
+                 strata::core::ConversationCheckpoint ck;
+                 ck.ids = ids;
+                 if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
+@@ -9400,6 +9457,8 @@ int main(int argc, char** argv) {
+                 if (at != nullptr) {
+                     if (!strata::core::conversation_checkpoint_restore(k == 0 ? *at : at->stage_parts[k - 1], to, g, e))
+                         return false;
++                } else if (!host_copy) {
++                    if (!strata::core::conversation_checkpoint_copy(from, to, g, bs[(size_t) b].ids, e)) return false;
+                 } else {
+                     strata::core::ConversationCheckpoint ck;
+                     ck.ids = bs[(size_t) b].ids;
+@@ -9408,6 +9467,12 @@ int main(int argc, char** argv) {
+                         return false;
+                 }
+                 for (int64_t j = 0; j < from.qsa_alloc; ++j) {
++                    if (!host_copy) {
++                        if (!strata::core::conversation_kv_copy(from.qsa_states[from.qsa_ord0 + j],
++                                                                to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
++                            return false;
++                        continue;
++                    }
+                     strata::core::ConversationKv img;
+                     if (!strata::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
+                         return false;
+@@ -11226,11 +11291,17 @@ int main(int argc, char** argv) {
+                     break;
+                 }
+                 at = to;
++                static const bool ckpt_timing = std::getenv("STRATA_BATCH_COPY_TIMING") != nullptr;
++                const auto tck = Clock::now();
+                 if ((to == turn_at || to == root_at || to == message_at || to == pin_at) &&
+                     !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at)) {   // the tail kind leaves first
+                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
+                     return 1;
+                 }
++                if (ckpt_timing && (to == turn_at || to == root_at || to == message_at || to == pin_at))
++                    std::fprintf(stderr, "strata batch: checkpoint at %lld tokens saved in %.1f ms (read part %.1f ms)\n",
++                                 (long long) to, std::chrono::duration<double, std::milli>(Clock::now() - tck).count(),
++                                 std::chrono::duration<double, std::milli>(tck - tsp).count());
+                 if (to == pin_at && !pin_checkpoint(pin_at))
+                     std::fprintf(stderr, "strata serve: pin=%lld: its checkpoint was not kept\n", (long long) pin_at);
+                 if (trace && to == message_at)
