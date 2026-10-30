@@ -186,9 +186,14 @@ tokens. The tokens are the serial loop's, up to CPU rounding.
   It runs exactly two cards, so one card, Arc A-series cards and three or more cards stay serial.
 - **Draft layer placement:** with the pipeline on, the draft layer loads on the first card, whose window has finished when the
   chain starts. `STRATA_MTP_STAGE0=0` keeps the old place.
-- **Off, with one log line saying why:** `--batch` slots, `--peer-device`, the helper caches (`--expert-cache-device1..3`, which
-  `--remote-expert-opt` builds on), a split onto one GPU, no draft layer, and on three or more stages `--pipeline-windows 1` and
-  `--adapt-async 1`. A request with repetition penalties or coupled draft sampling decodes serially.
+- **Off, with one log line saying why:** `--batch` slots (for `--pipeline-windows 2`), `--peer-device`, the helper caches
+  (`--expert-cache-device1..3`, which `--remote-expert-opt` builds on), a split onto one GPU, no draft layer, and on three or
+  more stages `--pipeline-windows 1` and `--adapt-async 1`. A request with repetition penalties or coupled draft sampling
+  decodes serially.
+- **`--pipeline-windows 1` beside `--batch`:** on two stages it is the one mode that runs beside `--batch` slots, where every
+  admitted request reads its prompt through the verify windows while the slots wait. On 2x gfx1100 (IQ3_S, 8 slots, engine
+  0.1.43.1) a 56-token prompt read in ~270 ms instead of ~420 ms, with the same answers byte for byte. `--batch-mtp` turns
+  off beside it.
 - **Cost:** a second verify window on each card, 160 MiB less expert cache per card, plus two copies of the first card's
   recurrent state (about 3 MiB per GDN layer it runs).
 - **Config:** `"args": [ ..., "--pipeline-windows", "2" ]` with `"layer_split": "20"`.
